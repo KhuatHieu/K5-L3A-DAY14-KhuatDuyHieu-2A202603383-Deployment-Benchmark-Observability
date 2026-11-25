@@ -354,9 +354,61 @@ Dọn stack: `docker compose -p k5-day14-docker down -v`.
 
 ---
 
+## Part 3: Cloud Deployment
+
+> Lớp K5 deploy **agent Part 6** (`06-lab-complete/`) sau khi đạt `PASS 12/12`, không deploy app mẫu trong `03-cloud-deployment/` (xem CHECKPOINTS, CP6). Mục 3.1 dưới đây sẽ được điền sau Part 6.
+
+### Exercise 3.1: Deploy (nền tảng chính)
+
+- Nền tảng: _(điền sau Part 6)_
+- URL public: _(điền sau Part 6, chi tiết trong `DEPLOYMENT.md`)_
+- Kết quả 4 lệnh tự kiểm ở CP6 (`/health` 200, `/ready` 200, `/ask` không key 401, có key 200): _(điền sau Part 6)_
+
+### Exercise 3.2: So sánh `railway.toml` với `render.yaml`
+
+Files: `03-cloud-deployment/railway/railway.toml` và `03-cloud-deployment/render/render.yaml`.
+
+| Khía cạnh | `railway.toml` (Railway) | `render.yaml` (Render Blueprint) | Vì sao khác |
+|---|---|---|---|
+| **Định dạng và phạm vi** | TOML, cấu hình **một service** (build + deploy của service chứa file) | YAML, mô tả **cả hạ tầng**: danh sách `services` gồm web service **và** Redis | Railway coi project gồm nhiều service tạo trên dashboard/CLI, mỗi service có config riêng. Render Blueprint là Infrastructure as Code: một file dựng toàn bộ stack |
+| **Cách build** | `builder = "NIXPACKS"`: Railway tự đoán ngôn ngữ và cách cài (có thể đổi sang `DOCKERFILE`) | `runtime: python` + `buildCommand: pip install -r requirements.txt` ghi rõ | Railway ưu tiên "zero-config", tự detect. Render yêu cầu khai báo runtime và lệnh build tường minh. Phiên bản Python cũng phải tự ghim qua env `PYTHON_VERSION=3.11.0` |
+| **Start command** | `uvicorn app:app --host 0.0.0.0 --port $PORT` | Giống hệt | Cả hai nền tảng đều **inject `PORT` động**, nên app phải bind `0.0.0.0:$PORT` (bài học Part 1) |
+| **Health check** | `healthcheckPath = "/health"`, `healthcheckTimeout = 30` | `healthCheckPath: /health` | Cùng mục đích: chỉ chuyển traffic sang bản deploy mới khi `/health` trả 200. Tên khoá khác nhau (`healthcheckPath` và `healthCheckPath`) |
+| **Restart khi crash** | Khai báo rõ: `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không có trong file, Render tự restart | Railway cho phép chỉnh chính sách restart. Render quản lý việc này, người dùng không cấu hình |
+| **Biến môi trường và secret** | **Không có trong file**, đặt bằng `railway variables set ...` hoặc dashboard | Khai báo trong `envVars`: giá trị thường ghi thẳng (`ENVIRONMENT=production`), secret dùng `sync: false` (nhập tay trên dashboard) hoặc `generateValue: true` (Render tự sinh `AGENT_API_KEY` ngẫu nhiên) | Railway tách hẳn secret khỏi file nên không có nguy cơ commit nhầm. Render liệt kê **tên** biến trong file cho đầy đủ, nhưng giá trị secret vẫn không nằm trong git |
+| **Database / Redis** | Không khai báo, phải thêm Redis riêng trong project rồi tự trỏ `REDIS_URL` | Khai báo luôn `type: redis` (`agent-cache`, `plan: free`, `maxmemoryPolicy: allkeys-lru`) | Blueprint dựng Redis cùng lúc với app, nhưng file mẫu chưa nối `REDIS_URL` của web service tới Redis. Khi deploy Part 6 phải thêm `fromService` để lấy connection string |
+| **Region, gói, tự deploy** | Không có trong file (chọn trên dashboard) | `region: singapore`, `plan: free`, `autoDeploy: true` (push GitHub → tự deploy) | Render đưa nhiều lựa chọn hạ tầng vào code. Railway để trên dashboard. Railway deploy bằng `railway up` từ máy, còn Render kéo code từ GitHub |
+
+**Kết luận:** Railway dễ bắt đầu hơn: tự detect, deploy bằng CLI từ máy, file config ngắn, chỉ lo phần build và deploy. Render "khai báo" hơn: một file mô tả cả app lẫn Redis, region và gói, gắn với GitHub để tự deploy, nên dễ tái tạo và review trong PR. Khi deploy agent Part 6, cả hai đều cần đổi sang build bằng **Dockerfile** (`builder = "DOCKERFILE"`, hoặc `runtime: docker` trên Render), đúng như tiêu chí Deploy config trong `06-lab-complete/README.md`.
+
+### Exercise 3.3: Pipeline CI/CD trên Cloud Run
+
+Files: `03-cloud-deployment/production-cloud-run/cloudbuild.yaml` và `service.yaml`.
+
+1. **Trigger:** mỗi lần push lên `main`, Cloud Build chạy `cloudbuild.yaml`. Các step chạy tuần tự nhờ `waitFor`.
+2. **Test:** trong container `python:3.11-slim`, cài `requirements.txt` + `pytest` rồi chạy `pytest tests/`. Test fail thì pipeline dừng, không build.
+3. **Build:** `docker build` image, gắn 2 tag `gcr.io/$PROJECT_ID/ai-agent:$COMMIT_SHA` và `:latest`, dùng `--cache-from ...:latest` để tận dụng layer cache. Sau đó **push** cả hai tag lên Container Registry.
+4. **Deploy:** `gcloud run deploy ai-agent` với **đúng image theo commit SHA** (rollback được về commit cũ), region `asia-southeast1`, `min-instances=1` (tránh cold start), `max-instances=10`, 512Mi/1 CPU, timeout 60s. Secret `OPENAI_API_KEY` lấy từ **Secret Manager** (`--set-secrets`), không nằm trong code.
+5. **`service.yaml`** mô tả cùng service đó theo dạng khai báo (Knative), áp bằng `gcloud run services replace`: autoscale 1–10 instance, mỗi instance tối đa 80 request đồng thời (`containerConcurrency`), secret `OPENAI_API_KEY` và `AGENT_API_KEY` từ Secret Manager, `livenessProbe` gọi `/health` và `startupProbe` gọi `/ready` (cùng hai endpoint đã học ở Part 1).
+
+**Nhận xét thêm:**
+
+- Thư mục `production-cloud-run/` không có `tests/`, `requirements.txt` hay `Dockerfile`. Chạy nguyên trạng thì step `test` fail ngay (pytest không thấy test nào sẽ trả exit code 5), và step `build` cũng không có Dockerfile để build. Pipeline này là mẫu, phải đặt cạnh code thật mới dùng được.
+- `service.yaml` dùng image `:latest`, còn `cloudbuild.yaml` deploy theo `:$COMMIT_SHA`. Nên dùng SHA ở cả hai nơi để biết chính xác bản nào đang chạy.
+
+### Checkpoint 3
+
+- [ ] Deploy thành công lên ít nhất 1 platform _(sau Part 6)_
+- [ ] Có public URL hoạt động _(sau Part 6)_
+- [x] Hiểu cách set environment variables trên cloud
+- [ ] Biết cách xem logs _(sau khi deploy)_
+
+---
+
 ## AI log
 
 | Part | Hỏi AI gì | Nhận được gì | Tự sửa / tự kiểm tra thế nào |
 |---|---|---|---|
 | Part 1 | Nhờ Claude Code (Opus 5.5) đọc repo, chạy bản develop và production của Part 1, rồi soạn câu trả lời | Danh sách anti-pattern, bảng so sánh, các lệnh curl và phân tích vì sao log JSON không hiện | Mọi output trong bài lấy từ lệnh chạy thật trên máy (curl, `kill -TERM`, exit code). Nguyên nhân mất log được kiểm chứng bằng cách chạy lại với `OPENAI_API_KEY=dummy` |
 | Part 2 | Nhờ Claude Code (Opus 5.5) build 2 image, chạy container và stack compose, trả lời Exercise 2.1–2.4, vẽ sơ đồ | Câu trả lời 2.1, giải thích multi-stage, sơ đồ stack, cách xử lý cổng 80 bị chiếm và Docker Hub rate limit (dùng `mirror.gcr.io`) | Kích thước image lấy từ `docker images` và `docker image inspect` trên máy, % tính từ số bytes. Kết quả 200/429 qua Nginx và kết nối nội bộ redis/qdrant đều từ lệnh chạy thật |
+| Part 3 | Nhờ Claude Code (Opus 5.5) so sánh `railway.toml` với `render.yaml` và mô tả pipeline Cloud Run | Bảng so sánh và mô tả 5 bước pipeline, kèm nhận xét pipeline mẫu thiếu `tests/` và `Dockerfile` | Đối chiếu từng dòng với file cấu hình trong repo (`ls production-cloud-run/` xác nhận không có `tests/` và `Dockerfile`). Phần deploy làm sau Part 6 |
