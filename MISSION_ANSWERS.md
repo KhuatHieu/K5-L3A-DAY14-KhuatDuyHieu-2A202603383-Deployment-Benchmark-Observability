@@ -356,13 +356,45 @@ Dọn stack: `docker compose -p k5-day14-docker down -v`.
 
 ## Part 3: Cloud Deployment
 
-> Lớp K5 deploy **agent Part 6** (`06-lab-complete/`) sau khi đạt `PASS 12/12`, không deploy app mẫu trong `03-cloud-deployment/` (xem CHECKPOINTS, CP6). Mục 3.1 dưới đây sẽ được điền sau Part 6.
+> Lớp K5 deploy **agent Part 6** (`06-lab-complete/`) sau khi đạt `PASS 12/12`, không deploy app mẫu trong `03-cloud-deployment/` (xem CHECKPOINTS, CP6). Chi tiết đầy đủ trong [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
-### Exercise 3.1: Deploy (nền tảng chính)
+### Exercise 3.1: Deploy lên Railway (nền tảng chính)
 
-- Nền tảng: _(điền sau Part 6)_
-- URL public: _(điền sau Part 6, chi tiết trong `DEPLOYMENT.md`)_
-- Kết quả 4 lệnh tự kiểm ở CP6 (`/health` 200, `/ready` 200, `/ask` không key 401, có key 200): _(điền sau Part 6)_
+- **Nền tảng:** Railway. Project `k5-day14-agent` gồm service `agent` (build từ `06-lab-complete/Dockerfile` theo `railway.toml`) và service `Redis` (Railway Redis). Hai service nối nhau qua private network `redis.railway.internal`.
+- **URL public:** https://agent-production-11dbcbd4.up.railway.app
+- **Biến môi trường** đặt trên Railway, không có trong code: `AGENT_API_KEY` (secret ngẫu nhiên), `REDIS_URL=${{Redis.REDIS_URL}}` (reference variable), `ENVIRONMENT=production`, `RATE_LIMIT_PER_MINUTE=10`, `DAILY_BUDGET_USD=1.0`, `MONTHLY_BUDGET_USD=10.0`, `LOG_LEVEL=INFO`. `PORT` do Railway tự cấp (8080).
+
+Các bước (trong `06-lab-complete/`):
+
+```bash
+railway init --name k5-day14-agent
+railway add --database redis
+railway add --service agent
+railway variable set --service agent --skip-deploys AGENT_API_KEY=<random> 'REDIS_URL=${{Redis.REDIS_URL}}' ENVIRONMENT=production ...
+railway up --service agent --detach        # build Dockerfile trên Railway
+railway domain --service agent             # tạo URL public
+```
+
+Trạng thái deployment: `BUILDING → DEPLOYING → SUCCESS` (khoảng 35 s). Redis: `SUCCESS`.
+
+**4 lệnh tự kiểm CP6** (`BASE` = URL trên, `AGENT_API_KEY` = key trên Railway):
+
+```text
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"
+200
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"
+200
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+401
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" -d '{"question":"Hello"}'
+200
+```
+
+`/ready` trả 200, tức là agent trên cloud kết nối được Redis. Rate limit trên cloud cũng hoạt động: 12 request liên tiếp → `200 ×8, 429 ×4` (2 slot đã dùng trước đó). `check_production_ready.py --public-url ...` → `✅ Public URL: GET .../health → 200`.
+
+**Xem log:** `railway logs --service agent`. Log JSON của app được Railway tự parse thành trường có cấu trúc (`event="startup" env="production" port=8080 ...`), lọc được trên dashboard.
+
+**Ghi chú:** Railway CLI 5.75 cảnh báo *"Config as Code (railway.json / railway.toml) is deprecated… Existing files keep working until 2026-12-01"* và gợi ý chuyển sang `.railway/railway.ts`. Bài vẫn dùng `railway.toml` vì tiêu chí 12 của script chấm yêu cầu file này.
 
 ### Exercise 3.2: So sánh `railway.toml` với `render.yaml`
 
@@ -398,10 +430,10 @@ Files: `03-cloud-deployment/production-cloud-run/cloudbuild.yaml` và `service.y
 
 ### Checkpoint 3
 
-- [ ] Deploy thành công lên ít nhất 1 platform _(sau Part 6)_
-- [ ] Có public URL hoạt động _(sau Part 6)_
+- [x] Deploy thành công lên ít nhất 1 platform (Railway)
+- [x] Có public URL hoạt động
 - [x] Hiểu cách set environment variables trên cloud
-- [ ] Biết cách xem logs _(sau khi deploy)_
+- [x] Biết cách xem logs (`railway logs --service agent`)
 
 ---
 
@@ -1102,3 +1134,4 @@ Ghi chú: khi container Redis đã dừng, `/ready` mất ~3.1 s mới trả 503
 | Part 4 | Nhờ Claude Code (Opus 5.5) chạy bản develop/production, viết script test 401/403/422/200/429, cài đặt cost guard bằng Redis cho Exercise 4.4 | Output các mã HTTP (token đã che), cài đặt `RedisCostGuard` dùng Lua script, test so sánh với lời giải mẫu | Mọi output từ server chạy thật trên máy. Cost guard Redis test với container `redis:7-alpine` thật. Test race condition có thêm độ trễ 2 ms giả lập cho lệnh `GET` (ghi rõ trong bài) |
 | Part 5 | Nhờ Claude Code (Opus 5.5) chạy health/ready, test SIGTERM khi đang có request, chạy stack 3 instance, `test_stateless.py`, thí nghiệm tắt 1 instance, restart toàn bộ và scale lên 4 | Output các test, giải thích liveness/readiness, phát hiện `/health` bị chặn 2.7 s do `time.sleep` trong `async def`, request 60 s khi 1 instance chết, Nginx không thấy instance mới khi chưa reload | Tất cả từ lệnh chạy thật trên máy. Một lần script test bị treo do lỗi `wait %1` của chính script (chờ nhầm process server), đã sửa và chạy lại |
 | Part 6 | Nhờ Claude Code (Opus 5.5) đọc `check_production_ready.py` và README để nắm yêu cầu, rồi viết toàn bộ TODO trong `06-lab-complete/` (config, auth, Redis client, rate limiter dùng Lua, cost guard, log JSON, health/ready, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) | Code đạt `PASS 12/12` (43/43 checks), kèm giải thích các quyết định thiết kế | Chạy `--static-only` → `--skip-docker` → bản đầy đủ có Docker. Test thêm bằng tay với `docker compose`: 401/422/200/429, header `Retry-After`, key trong Redis, tắt Redis để xem `/health` 200, `/ready` 503, `/ask` 503. Không sửa script chấm |
+| Part 3 (deploy) | Nhờ Claude Code (Opus 5.5) dùng Railway CLI tạo project, thêm Redis, đặt biến môi trường, deploy `06-lab-complete/` và tạo domain | Agent chạy trên Railway, URL public, nội dung `DEPLOYMENT.md` | Theo dõi deployment tới `SUCCESS`, chạy 4 lệnh tự kiểm CP6 (200/200/401/200), thử rate limit trên cloud, chạy `check_production_ready.py --public-url`, xem `railway logs`. API key sinh ngẫu nhiên, không in ra output và không có trong repo |
