@@ -1124,6 +1124,58 @@ Ghi chú: khi container Redis đã dừng, `/ready` mất ~3.1 s mới trả 503
 
 ---
 
+## Part 7: Benchmark & Observability
+
+Số liệu benchmark (Exercise 7.2–7.7) nằm trong [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md), report JSON trong `reports/`, CSV trong `benchmark-results/`.
+
+### Exercise 7.1: Đọc metrics của agent
+
+Gọi `/ask` một lần trên agent v2 (cổng 8002) rồi `curl -s http://localhost:8002/metrics | grep -v "^#"`:
+
+**1. Ba loại metric:**
+
+| Loại | Ví dụ trong output | Ý nghĩa |
+|---|---|---|
+| **Counter** (chỉ tăng) | `http_requests_total{method="POST",route="/ask",status="200"} 1.0`, `llm_tokens_total{model="mock-llm-small",type="input"} 91.0` | Đếm tích luỹ. Dùng `rate()` để ra req/s, token/s |
+| **Gauge** (lên xuống) | `agent_in_flight_requests 0.0`, `agent_info{model="mock-llm-small",version="v2"} 1.0` | Giá trị tức thời: số request đang xử lý, thông tin phiên bản |
+| **Histogram** (bucket) | `http_request_duration_seconds_bucket{le="0.2",method="POST",route="/ask"} 1.0` … `_sum`, `_count` | Đếm số quan sát rơi vào từng bucket `le`. Prometheus tính p95 bằng `histogram_quantile(0.95, rate(..._bucket[5m]))` |
+
+**2. Nếu dùng `request.url.path` làm label `route`:** mỗi URL lạ mà bot quét (`/wp-admin`, `/.env`, `/a1b2c3`…) sẽ tạo **một time series mới** cho *mỗi* metric có label `route` (counter, và cả 13 bucket + `_sum` + `_count` của histogram). Hàng nghìn URL ngẫu nhiên thì thành hàng chục nghìn series (**cardinality bùng nổ**): Prometheus tốn RAM/disk cho mỗi series, query chậm dần rồi có thể OOM. Nghĩa là kẻ tấn công **làm sập hệ thống giám sát chỉ bằng cách gửi URL rác**. Dùng route template thì mọi URL lạ gom vào **một** label. Kiểm chứng:
+
+```text
+$ for u in /wp-admin /.env /a1b2c3; do curl -s -o /dev/null -w "$u %{http_code}\n" localhost:8002$u; done
+/wp-admin 404
+/.env 404
+/a1b2c3 404
+$ curl -s localhost:8002/metrics | grep ^http_requests_total
+http_requests_total{method="GET",route="/health",status="200"} 1.0
+http_requests_total{method="POST",route="/ask",status="200"} 1.0
+http_requests_total{method="GET",route="unmatched",status="404"} 3.0      ← 3 URL lạ, chỉ 1 series
+```
+
+**Nhiệm vụ: thêm metric `agent_question_length_chars`** (`develop/app.py`):
+
+```python
+QUESTION_LENGTH = Histogram(
+    "agent_question_length_chars", "Độ dài câu hỏi (ký tự)",
+    buckets=(20, 50, 100, 200, 500, 1000, 2000),
+)
+# trong ask(), trước khi gọi LLM:
+QUESTION_LENGTH.observe(len(body.question))
+```
+
+Dùng Histogram với bucket cố định chứ không dùng label `length="40"`, vì độ dài có vô số giá trị (cũng là cardinality bùng nổ). Kết quả sau 1 câu hỏi dài 40 ký tự:
+
+```text
+agent_question_length_chars_bucket{le="20.0"} 0.0
+agent_question_length_chars_bucket{le="50.0"} 1.0
+...
+agent_question_length_chars_count 1.0
+agent_question_length_chars_sum 40.0
+```
+
+---
+
 ## AI log
 
 | Part | Hỏi AI gì | Nhận được gì | Tự sửa / tự kiểm tra thế nào |
@@ -1135,3 +1187,4 @@ Ghi chú: khi container Redis đã dừng, `/ready` mất ~3.1 s mới trả 503
 | Part 5 | Nhờ Claude Code (Opus 5.5) chạy health/ready, test SIGTERM khi đang có request, chạy stack 3 instance, `test_stateless.py`, thí nghiệm tắt 1 instance, restart toàn bộ và scale lên 4 | Output các test, giải thích liveness/readiness, phát hiện `/health` bị chặn 2.7 s do `time.sleep` trong `async def`, request 60 s khi 1 instance chết, Nginx không thấy instance mới khi chưa reload | Tất cả từ lệnh chạy thật trên máy. Một lần script test bị treo do lỗi `wait %1` của chính script (chờ nhầm process server), đã sửa và chạy lại |
 | Part 6 | Nhờ Claude Code (Opus 5.5) đọc `check_production_ready.py` và README để nắm yêu cầu, rồi viết toàn bộ TODO trong `06-lab-complete/` (config, auth, Redis client, rate limiter dùng Lua, cost guard, log JSON, health/ready, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) | Code đạt `PASS 12/12` (43/43 checks), kèm giải thích các quyết định thiết kế | Chạy `--static-only` → `--skip-docker` → bản đầy đủ có Docker. Test thêm bằng tay với `docker compose`: 401/422/200/429, header `Retry-After`, key trong Redis, tắt Redis để xem `/health` 200, `/ready` 503, `/ask` 503. Không sửa script chấm |
 | Part 3 (deploy) | Nhờ Claude Code (Opus 5.5) dùng Railway CLI tạo project, thêm Redis, đặt biến môi trường, deploy `06-lab-complete/` và tạo domain | Agent chạy trên Railway, URL public, nội dung `DEPLOYMENT.md` | Theo dõi deployment tới `SUCCESS`, chạy 4 lệnh tự kiểm CP6 (200/200/401/200), thử rate limit trên cloud, chạy `check_production_ready.py --public-url`, xem `railway logs`. API key sinh ngẫu nhiên, không in ra output và không có trong repo |
+| Part 7 Bước 1 | Nhờ Claude Code (Opus 5.5) chạy agent v1/v2, thêm metric `agent_question_length_chars`, chạy load test 4 mức concurrency và 3 mức `MOCK_SLOW_RATE`, eval v1/v2, sửa `KNOWLEDGE_BASE`, viết job CI, điền mục 1–3 của `BENCHMARK_REPORT.md` | Các file JSON trong `reports/`, 2 entry KB mới, `.github/workflows/eval-quality-gate.yml`, nhận xét | Mọi số trong báo cáo được đọc thẳng từ JSON bằng script, không chép tay. Đã kiểm tra trigger KB mới không khớp câu khác. Chạy lại đúng lệnh verification của Lab Coach (`--min-accuracy 1.0` → 23/23, exit 0) và kiểm chứng gate trả exit 1 với v1 |
