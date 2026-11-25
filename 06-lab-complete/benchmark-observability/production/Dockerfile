@@ -26,6 +26,10 @@ RUN chown -R agent:agent /app
 USER agent
 
 ENV PATH=/home/agent/.local/bin:$PATH
+# User "agent" có HOME=/app (useradd -d /app) → mặc định Python tìm user site-packages ở
+# /app/.local, không thấy thư viện đã copy sang /home/agent/.local → "No module named uvicorn".
+# Chỉ rõ PYTHONUSERBASE để Python tìm đúng chỗ (giống Dockerfile ở Part 5).
+ENV PYTHONUSERBASE=/home/agent/.local
 ENV PYTHONPATH=/app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

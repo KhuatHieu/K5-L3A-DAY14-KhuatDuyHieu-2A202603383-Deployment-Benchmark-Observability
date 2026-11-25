@@ -1166,6 +1166,26 @@ QUESTION_LENGTH.observe(len(body.question))
 
 Dùng Histogram với bucket cố định chứ không dùng label `length="40"`, vì độ dài có vô số giá trị (cũng là cardinality bùng nổ). Kết quả sau 1 câu hỏi dài 40 ký tự:
 
+### Exercise 7.2–7.7
+
+Trả lời đầy đủ trong `BENCHMARK_REPORT.md`:
+
+| Exercise | Mục trong báo cáo | Kết quả chính |
+|---|---|---|
+| 7.2 Load test & SLO | 2.1, 2.2 | 4 mức concurrency đều PASS SLO p95 ≤ 500 ms. `MOCK_SLOW_RATE=0.1` làm p95 lên 1690.6 ms (FAIL) trong khi avg chỉ 338.5 ms |
+| 7.3 Eval & quality gate | 3 | v1 4.3 % → v2 91.3 % → v2 sau khi sửa KB **100 % (23/23)**, 0 regression. CI: `.github/workflows/eval-quality-gate.yml` |
+| 7.4 Observability stack | 4.1 | p95 294.7 ms / avg 240.0 ms; Nginx chia đều 10.24 / 10.24 req/s; input tokens/s > output vì prompt có context RAG; `/metrics` qua Nginx → 404 |
+| 7.5 Tracing | 4.3 | Trace chậm 1724.1 ms, span `chat mock-llm-small` 1695.5 ms (98.3 %), `trace_id` khớp log JSON. Trace lỗi có event `exception` |
+| 7.6 Alerts & chaos | 4.2 | A firing sau 85 s, B 135 s, C 130 s, D 40 s; E không alert nào nhưng eval trên stack ra 4.3 % (gate FAIL) |
+| 7.7 Report + scaling | 5, 6 | 1 vs 3 instance gần như giống nhau (RPS ~60, p95 230/220 ms): nút thắt là độ trễ LLM và tải closed-loop của Locust, không phải CPU |
+
+Khi làm Bước 2, mình gặp và xử lý 2 vấn đề của đề (ghi chi tiết trong báo cáo):
+
+1. `production/Dockerfile` crash loop `No module named 'uvicorn'` vì user `agent` có `HOME=/app`. Sửa bằng `ENV PYTHONUSERBASE=/home/agent/.local`.
+2. Lệnh mẫu `docker compose run locust` (không có `--no-deps`) tự đưa số agent về `replicas: 2`, làm benchmark scale 1 vs 3 sai. Phát hiện bằng Prometheus `up{job="agent"}`, chạy lại với `--no-deps`.
+
+Kết quả của Exercise 7.1:
+
 ```text
 agent_question_length_chars_bucket{le="20.0"} 0.0
 agent_question_length_chars_bucket{le="50.0"} 1.0
@@ -1188,3 +1208,4 @@ agent_question_length_chars_sum 40.0
 | Part 6 | Nhờ Claude Code (Opus 5.5) đọc `check_production_ready.py` và README để nắm yêu cầu, rồi viết toàn bộ TODO trong `06-lab-complete/` (config, auth, Redis client, rate limiter dùng Lua, cost guard, log JSON, health/ready, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) | Code đạt `PASS 12/12` (43/43 checks), kèm giải thích các quyết định thiết kế | Chạy `--static-only` → `--skip-docker` → bản đầy đủ có Docker. Test thêm bằng tay với `docker compose`: 401/422/200/429, header `Retry-After`, key trong Redis, tắt Redis để xem `/health` 200, `/ready` 503, `/ask` 503. Không sửa script chấm |
 | Part 3 (deploy) | Nhờ Claude Code (Opus 5.5) dùng Railway CLI tạo project, thêm Redis, đặt biến môi trường, deploy `06-lab-complete/` và tạo domain | Agent chạy trên Railway, URL public, nội dung `DEPLOYMENT.md` | Theo dõi deployment tới `SUCCESS`, chạy 4 lệnh tự kiểm CP6 (200/200/401/200), thử rate limit trên cloud, chạy `check_production_ready.py --public-url`, xem `railway logs`. API key sinh ngẫu nhiên, không in ra output và không có trong repo |
 | Part 7 Bước 1 | Nhờ Claude Code (Opus 5.5) chạy agent v1/v2, thêm metric `agent_question_length_chars`, chạy load test 4 mức concurrency và 3 mức `MOCK_SLOW_RATE`, eval v1/v2, sửa `KNOWLEDGE_BASE`, viết job CI, điền mục 1–3 của `BENCHMARK_REPORT.md` | Các file JSON trong `reports/`, 2 entry KB mới, `.github/workflows/eval-quality-gate.yml`, nhận xét | Mọi số trong báo cáo được đọc thẳng từ JSON bằng script, không chép tay. Đã kiểm tra trigger KB mới không khớp câu khác. Chạy lại đúng lệnh verification của Lab Coach (`--min-accuracy 1.0` → 23/23, exit 0) và kiểm chứng gate trả exit 1 với v1 |
+| Part 7 Bước 2 | Nhờ Claude Code (Opus 5.5) bật stack observability, chạy benchmark scaling bằng Locust headless, truy vấn Prometheus/Jaeger, chạy 5 thí nghiệm phá hệ thống, chụp ảnh bằng Chrome headless và điền mục 4–6 của `BENCHMARK_REPORT.md` | Sửa Dockerfile production, CSV `scale_1`/`scale_3`, 5 ảnh, bảng thí nghiệm với thời gian tới firing, trace + log | Thời gian tới firing đo bằng cách đọc `/api/v1/alerts` mỗi 5 s. Số instance khi benchmark được kiểm chứng bằng `up{job="agent"}` (nhờ vậy phát hiện lần chạy đầu sai và chạy lại). Mọi số trong bảng được đối chiếu tự động với CSV/JSON. Ảnh do Chrome headless chụp trên chính máy chạy stack |
