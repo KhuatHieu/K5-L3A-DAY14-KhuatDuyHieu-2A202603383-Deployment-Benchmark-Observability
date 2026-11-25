@@ -135,8 +135,228 @@ Gửi SIGTERM (`kill -TERM <pid>`): process thoát với **exit code 0**, log in
 
 ---
 
+## Part 2: Docker
+
+Môi trường: Docker Engine 29.10.0, linux/amd64. Mọi image đều build **từ gốc repo** (lưu ý số 4 trong README của lớp K5).
+
+### Exercise 2.1: Dockerfile questions
+
+File: `02-docker/develop/Dockerfile`
+
+1. **Base image:** `python:3.11`, bản Python đầy đủ trên Debian, có sẵn gcc, header và nhiều tool. Vì vậy image rất nặng (đo được 1.66 GB ở Exercise 2.2).
+2. **Working directory:** `/app` (`WORKDIR /app`). Các lệnh `COPY`, `RUN` và `CMD` phía sau đều chạy tương đối từ thư mục này, và Docker tự tạo thư mục nếu chưa có.
+3. **Tại sao `COPY requirements.txt` trước:** để tận dụng **Docker layer cache**. Mỗi lệnh trong Dockerfile tạo một layer. Khi một layer thay đổi, mọi layer phía sau phải build lại. `requirements.txt` hiếm khi đổi, còn `app.py` đổi liên tục. Đặt `COPY requirements.txt` và `RUN pip install` trước `COPY app.py` thì khi chỉ sửa code, Docker dùng lại layer `pip install` đã cache và chỉ chạy lại bước copy code. Build mất vài giây thay vì cài lại toàn bộ thư viện. Nếu `COPY . .` đứng trước `pip install`, chỉ cần sửa một dòng code là cài lại hết.
+4. **CMD vs ENTRYPOINT:**
+   - `CMD ["python", "app.py"]` là lệnh **mặc định** và bị ghi đè hoàn toàn khi truyền lệnh khác vào `docker run`. Ví dụ `docker run my-agent:develop sh` chạy `sh` thay cho app.
+   - `ENTRYPOINT` là chương trình **cố định** của container. Tham số truyền vào `docker run` (hoặc `CMD`) được **nối thêm** vào sau nó làm argument, và chỉ đổi được bằng `--entrypoint`.
+   - Hai lệnh thường đi chung: `ENTRYPOINT ["uvicorn"]` + `CMD ["main:app", "--port", "8000"]`, trong đó `ENTRYPOINT` cố định chương trình còn `CMD` cho tham số mặc định có thể đổi.
+   - Cả hai nên viết ở dạng exec (mảng JSON) để process là **PID 1** và nhận trực tiếp SIGTERM. Dạng shell (`CMD python app.py`) chạy qua `/bin/sh -c`, nên signal có thể không tới app.
+
+### Exercise 2.2: Build và run bản develop
+
+```bash
+docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .
+docker run -d --name p2-dev -p 8000:8000 my-agent:develop
+```
+
+```text
+$ docker ps
+p2-dev  my-agent:develop  Up Less than a second  0.0.0.0:8000->8000/tcp, [::]:8000->8000/tcp
+
+$ curl -i -X POST "http://localhost:8000/ask?question=What%20is%20Docker%3F"
+HTTP/1.1 200 OK
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+
+$ curl http://localhost:8000/health
+{"status":"ok","uptime_seconds":0.5,"container":true}
+```
+
+Bản develop của Part 2 vẫn nhận `question` qua query string (lưu ý số 3). Debug container:
+
+```text
+$ docker exec p2-dev sh -c 'whoami; pwd'
+root
+/app
+
+$ docker logs p2-dev
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     172.17.0.1:60996 - "POST /ask?question=What%20is%20Docker%3F HTTP/1.1" 200 OK
+```
+
+**Quan sát:** container chạy bằng **root** và không có `HEALTHCHECK`. Image size (`docker images my-agent:develop`): **1.66 GB** (`docker image inspect` → `Size = 1 662 983 689` bytes).
+
+### Exercise 2.3: Multi-stage build
+
+File: `02-docker/production/Dockerfile`
+
+- **Stage 1 (`builder`)** dùng `python:3.11-slim`, cài thêm `gcc` và `libpq-dev` (tool để compile các package có phần C), rồi `pip install --user` để mọi thư viện nằm gọn trong `/root/.local`. Stage này **không được deploy**, nó chỉ là nơi build.
+- **Stage 2 (`runtime`)** bắt đầu lại từ một `python:3.11-slim` sạch:
+  - tạo user `appuser` (non-root)
+  - `COPY --from=builder /root/.local` để chỉ lấy thư viện đã cài, cộng với `main.py` và `utils/`
+  - `chown` cho `appuser`, rồi `USER appuser`
+  - có `HEALTHCHECK` gọi `/health`
+  - `CMD uvicorn ... --workers 2`
+- **Tại sao image nhỏ hơn:**
+  1. Base là `slim` thay vì bản full: bỏ compiler, man page và các thư viện hệ thống không cần.
+  2. Mọi thứ chỉ phục vụ việc build (gcc, libpq-dev, apt cache, pip cache) nằm lại ở stage builder và bị bỏ đi. Image cuối chỉ chứa layer của stage `runtime`. Xem `docker history`: layer thư viện được copy sang chỉ nặng **40.2 MB**.
+  3. `--no-cache-dir` và `rm -rf /var/lib/apt/lists/*` không để rác trong layer.
+
+```bash
+docker build -f 02-docker/production/Dockerfile -t my-agent:advanced .
+```
+
+```text
+$ docker images my-agent
+IMAGE               ID             DISK USAGE   CONTENT SIZE
+my-agent:advanced   7560dd3f4e7a        237MB         57.4MB
+my-agent:develop    c9ab3dc5790c       1.66GB          426MB
+```
+
+| Image | Size (`DISK USAGE`) | Bytes (`docker image inspect`) | Content size (nén) |
+|---|---:|---:|---:|
+| Develop (`python:3.11`, single-stage) | **1.66 GB** | 1 662 983 689 | 426 MB |
+| Production (`python:3.11-slim`, multi-stage) | **237 MB** | 237 385 955 | 57.4 MB |
+| **Chênh lệch** | **nhỏ hơn 85.7 %** (≈ 7.0 lần) | | nhỏ hơn 86.5 % |
+
+Docker 29 dùng containerd image store, nên `docker images` hiện hai cột: `DISK USAGE` (dung lượng sau khi giải nén trên đĩa) và `CONTENT SIZE` (dung lượng nén khi push/pull). Phần trăm chênh lệch tính theo `DISK USAGE`: `(1 - 237 385 955 / 1 662 983 689) × 100 = 85.7 %`.
+
+Chạy thử bản production:
+
+```text
+$ docker run -d --name p2-prod -p 8000:8000 my-agent:advanced
+$ curl http://localhost:8000/health
+{"status":"ok","uptime_seconds":0.2,"version":"2.0.0","timestamp":"2026-11-25T08:21:49.358028"}
+
+$ curl -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question": "What is Docker?"}'
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+
+$ docker exec p2-prod whoami
+appuser
+$ docker exec p2-prod which gcc
+(không có gcc)
+
+$ docker ps   # sau ~30 s, HEALTHCHECK chạy lần đầu
+p2-prod  Up 31 seconds (healthy)
+```
+
+Log có 2 dòng `Starting agent...` vì `--workers 2` chạy 2 process. Container chạy bằng `appuser`, không có compiler trong image cuối, và Docker tự đánh dấu `healthy`.
+
+### Exercise 2.4: Docker Compose stack
+
+File: `02-docker/production/docker-compose.yml`. Chạy theo lưu ý số 5 và 7 trong README (cần `.env.local`, có đặt `-p`):
+
+```bash
+cd 02-docker/production
+touch .env.local
+docker compose -p k5-day14-docker up -d --build
+```
+
+**Architecture diagram:**
+
+```text
+                 Host (máy mình)
+                       │  :80 (và :443)
+                       ▼
+ ┌──────────────────── network "internal" (bridge) ────────────────────┐
+ │                                                                     │
+ │   ┌──────────────────────────┐                                      │
+ │   │ nginx  (nginx:alpine)    │  reverse proxy + load balancer       │
+ │   │ - rate limit 10 r/s/IP   │  + security headers                  │
+ │   │   (burst 20) → 429       │                                      │
+ │   └────────────┬─────────────┘                                      │
+ │                │ proxy_pass http://agent:8000  (upstream agent_backend)
+ │                ▼                                                    │
+ │   ┌──────────────────────────┐                                      │
+ │   │ agent (build Dockerfile, │  FastAPI, uvicorn 2 workers          │
+ │   │  target: runtime)        │  không publish port ra host          │
+ │   └──────┬─────────────┬─────┘                                      │
+ │          │             │  env REDIS_URL / QDRANT_URL                │
+ │          ▼             ▼                                            │
+ │   ┌─────────────┐  ┌──────────────────┐                             │
+ │   │ redis:7-    │  │ qdrant:v1.9.0    │                             │
+ │   │ alpine      │  │ vector DB (RAG)  │                             │
+ │   │ cache/rate  │  │ :6333            │                             │
+ │   │ limit :6379 │  │                  │                             │
+ │   └──────┬──────┘  └────────┬─────────┘                             │
+ └──────────┼──────────────────┼───────────────────────────────────────┘
+            ▼                  ▼
+     volume redis_data   volume qdrant_data
+```
+
+**Services được start (4):** `redis`, `qdrant`, `agent`, `nginx`. Thứ tự khởi động do `depends_on` quyết định: `agent` chờ `redis` và `qdrant` **healthy** (`condition: service_healthy`), còn `nginx` chờ `agent` start.
+
+```text
+$ docker compose -p k5-day14-docker ps
+SERVICE   IMAGE                   STATUS                    PORTS
+agent     k5-day14-docker-agent   Up 39 seconds (healthy)   8000/tcp
+nginx     nginx:alpine            Up 39 seconds             0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+qdrant    qdrant/qdrant:v1.9.0    Up 50 seconds (healthy)   6333-6334/tcp
+redis     redis:7-alpine          Up 50 seconds (healthy)   6379/tcp
+```
+
+**Chúng giao tiếp thế nào:**
+
+- Cả 4 service nằm chung bridge network `internal`. Docker có DNS nội bộ, nên các service gọi nhau **bằng tên service** (`agent`, `redis`, `qdrant`) thay vì IP. Kiểm tra từ trong container agent:
+
+  ```text
+  $ docker compose -p k5-day14-docker exec -T agent python -c "...socket.create_connection..."
+  redis -> 172.20.0.3 port 6379 OK
+  qdrant -> 172.20.0.2 port 6333 OK
+  ```
+
+- **Chỉ `nginx` publish port ra host** (80, 443). `agent`, `redis` và `qdrant` không có `ports:` nên bên ngoài không gọi thẳng được (`curl localhost:8000` → `Failed to connect`). Mọi traffic đi qua Nginx, là nơi đặt rate limit và security header.
+- Nginx dùng `proxy_pass http://agent_backend` với `upstream agent_backend { server agent:8000; }`. Khi scale agent, Nginx round-robin giữa các instance.
+- Agent nhận địa chỉ Redis và Qdrant qua env (`REDIS_URL=redis://redis:6379/0`, `QDRANT_URL=http://qdrant:6333`). Secret nằm trong `env_file: .env.local`, file này đã có trong `.gitignore`.
+- Dữ liệu Redis và Qdrant nằm trên named volume (`redis_data`, `qdrant_data`), nên container bị xoá thì dữ liệu vẫn còn.
+
+**Test qua Nginx:**
+
+```text
+$ curl -i http://localhost/health
+HTTP/1.1 200 OK
+Server: nginx
+Content-Type: application/json
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+
+{"status":"ok","uptime_seconds":7.8,"version":"2.0.0","timestamp":"2026-11-25T08:24:50.000753"}
+
+$ curl -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question": "Explain microservices"}'
+HTTP/1.1 200 OK
+{"answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+Header `Server: nginx` (không lộ version do `server_tokens off`) và 3 security header chứng tỏ request đã đi qua Nginx.
+
+Thử rate limit của Nginx: bắn 40 request `POST /ask` song song:
+
+```text
+     21 200
+     19 429
+```
+
+Kết quả khớp cấu hình `rate=10r/s burst=20 nodelay`: 1 request trong hạn mức cộng 20 request burst được đi qua, phần còn lại bị trả **429**. Log nginx: `"POST /ask HTTP/1.1" 429 45`.
+
+Dọn stack: `docker compose -p k5-day14-docker down -v`.
+
+**Sự cố gặp phải khi làm:**
+
+- Cổng 80 trên máy đang bị nginx hệ thống chiếm. Phải dừng service đó trước khi `docker compose up`, nếu không thì container `nginx` lỗi `bind: address already in use`.
+- Docker Hub trả `You have reached your unauthenticated pull rate limit` khi pull `redis`, `nginx` và `qdrant`. Cách xử lý: pull từ mirror công khai `mirror.gcr.io` (`docker pull mirror.gcr.io/library/redis:7-alpine` rồi `docker tag ... redis:7-alpine`, tương tự cho 2 image còn lại). Cách khác là `docker login` để có hạn mức cao hơn.
+
+### Checkpoint 2
+
+- [x] Hiểu cấu trúc Dockerfile
+- [x] Biết lợi ích của multi-stage builds
+- [x] Hiểu Docker Compose orchestration
+- [x] Biết cách debug container (`docker logs`, `docker exec`)
+
+---
+
 ## AI log
 
 | Part | Hỏi AI gì | Nhận được gì | Tự sửa / tự kiểm tra thế nào |
 |---|---|---|---|
 | Part 1 | Nhờ Claude Code (Opus 5.5) đọc repo, chạy bản develop và production của Part 1, rồi soạn câu trả lời | Danh sách anti-pattern, bảng so sánh, các lệnh curl và phân tích vì sao log JSON không hiện | Mọi output trong bài lấy từ lệnh chạy thật trên máy (curl, `kill -TERM`, exit code). Nguyên nhân mất log được kiểm chứng bằng cách chạy lại với `OPENAI_API_KEY=dummy` |
+| Part 2 | Nhờ Claude Code (Opus 5.5) build 2 image, chạy container và stack compose, trả lời Exercise 2.1–2.4, vẽ sơ đồ | Câu trả lời 2.1, giải thích multi-stage, sơ đồ stack, cách xử lý cổng 80 bị chiếm và Docker Hub rate limit (dùng `mirror.gcr.io`) | Kích thước image lấy từ `docker images` và `docker image inspect` trên máy, % tính từ số bytes. Kết quả 200/429 qua Nginx và kết nối nội bộ redis/qdrant đều từ lệnh chạy thật |
